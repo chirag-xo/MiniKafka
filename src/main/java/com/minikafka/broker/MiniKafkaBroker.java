@@ -26,6 +26,7 @@ public class MiniKafkaBroker implements Broker {
     private final Map<String, Topic> topics = new ConcurrentHashMap<>();
     private final com.minikafka.offset.OffsetManager offsetManager = new com.minikafka.offset.InMemoryOffsetManager();
     private final com.minikafka.group.ConsumerGroupCoordinator groupCoordinator = new com.minikafka.group.InMemoryConsumerGroupCoordinator(this);
+    private final com.minikafka.metrics.BrokerMetrics metrics = new com.minikafka.metrics.BrokerMetrics();
     private final java.nio.file.Path dataDir;
 
     public MiniKafkaBroker() {
@@ -93,14 +94,30 @@ public class MiniKafkaBroker implements Broker {
 
     @Override
     public long append(String topicName, int partitionId, Message message) {
-        Topic topic = getTopic(topicName);
-        return topic.append(partitionId, message);
+        long start = System.nanoTime();
+        try {
+            Topic topic = getTopic(topicName);
+            long offset = topic.append(partitionId, message);
+            long latencyUs = Math.max(1, (System.nanoTime() - start) / 1000);
+            metrics.recordProduce(1, message.value().length);
+            metrics.recordProduceLatencyUs(latencyUs);
+            return offset;
+        } catch (Exception e) {
+            metrics.recordProduceError();
+            throw e;
+        }
     }
 
     @Override
     public List<Message> read(String topicName, int partitionId, long fromOffset, int maxMessages) {
         Topic topic = getTopic(topicName);
-        return topic.read(partitionId, fromOffset, maxMessages);
+        List<Message> msgs = topic.read(partitionId, fromOffset, maxMessages);
+        long bytes = 0;
+        for (Message m : msgs) {
+            bytes += m.value().length;
+        }
+        metrics.recordFetch(msgs.size(), bytes);
+        return msgs;
     }
 
     @Override
@@ -120,5 +137,10 @@ public class MiniKafkaBroker implements Broker {
     @Override
     public com.minikafka.group.ConsumerGroupCoordinator getGroupCoordinator() {
         return groupCoordinator;
+    }
+
+    @Override
+    public com.minikafka.metrics.BrokerMetrics getMetrics() {
+        return metrics;
     }
 }

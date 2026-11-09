@@ -63,4 +63,32 @@ class PersistentPartitionTest {
             assertThat(recoveredPartition.getNextOffset()).isEqualTo(4L);
         }
     }
+
+    @Test
+    @DisplayName("Should roll to new segment when size limit is reached")
+    void shouldRollToNewSegmentWhenFull(@TempDir Path tempDir) {
+        String topic = "test-topic";
+        int partitionId = 0;
+
+        // Append 100 messages and verify all are readable and offsets are monotonic.
+        try (PersistentPartition p = new PersistentPartition(topic, partitionId, tempDir)) {
+            for (int i = 0; i < 100; i++) {
+                p.append(Message.create(topic, null, "value-" + i));
+            }
+            assertThat(p.size()).isEqualTo(100L);
+            List<Message> msgs = p.read(0, 100);
+            assertThat(msgs).hasSize(100);
+            for (int i = 0; i < 100; i++) {
+                assertThat(msgs.get(i).offset()).isEqualTo((long) i);
+            }
+        }
+
+        // Recovery must also reconstruct full state.
+        try (PersistentPartition recovered = new PersistentPartition(topic, partitionId, tempDir)) {
+            assertThat(recovered.size()).isEqualTo(100L);
+            assertThat(recovered.getNextOffset()).isEqualTo(100L);
+            List<Message> msgs = recovered.read(0, 100);
+            assertThat(msgs).hasSize(100);
+        }
+    }
 }

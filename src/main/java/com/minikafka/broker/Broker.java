@@ -86,4 +86,11 @@ public interface Broker {
      * @return The coordinator managing consumer groups and partition rebalancing.
      */
     com.minikafka.group.ConsumerGroupCoordinator getGroupCoordinator();
+
+    /**
+     * @return The broker metrics registry.
+     */
+    default com.minikafka.metrics.BrokerMetrics getMetrics() {
+        return null;
+    }
 }
