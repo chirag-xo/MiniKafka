@@ -74,7 +74,7 @@ Built to demonstrate deep mastery of **concurrent systems programming**, **NIO s
 
 ```bash
 # Clone and run all 107 tests
-git clone https://github.com/YOUR_USERNAME/MiniKafka.git
+git clone https://github.com/chirag-xo/MiniKafka.git
 cd MiniKafka
 mvn test
 ```
