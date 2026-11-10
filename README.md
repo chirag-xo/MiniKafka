@@ -1,5 +1,11 @@
 # MiniKafka 🗂️
 
+[![MiniKafka CI](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml)
+![Java 21](https://img.shields.io/badge/Java-21-orange?logo=openjdk)
+![Maven](https://img.shields.io/badge/Build-Maven-C71A36?logo=apachemaven)
+![Tests](https://img.shields.io/badge/Tests-107%20Passing-brightgreen)
+![Zero Dependencies](https://img.shields.io/badge/Runtime%20Dependencies-Zero-blue)
+
 A **Kafka-inspired, append-only event-streaming broker** built from scratch in Java 21 — zero external runtime dependencies.
 
 Built to demonstrate deep mastery of **concurrent systems programming**, **NIO storage engines**, **distributed system primitives**, and **clean OOP architecture** in Java.
