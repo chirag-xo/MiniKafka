@@ -3,7 +3,7 @@
 [![MiniKafka CI](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml)
 ![Java 21](https://img.shields.io/badge/Java-21-orange?logo=openjdk)
 ![Maven](https://img.shields.io/badge/Build-Maven-C71A36?logo=apachemaven)
-![Tests](https://img.shields.io/badge/Tests-107%20Passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-116%20Passing-brightgreen)
 ![Zero Dependencies](https://img.shields.io/badge/Runtime%20Dependencies-Zero-blue)
 
 A **Kafka-inspired, append-only event-streaming broker** built from scratch in Java 21 — zero external runtime dependencies.
@@ -49,7 +49,7 @@ Built to demonstrate deep mastery of **concurrent systems programming**, **NIO s
 | `producer` | `MiniKafkaProducer` — key-hash + round-robin partitioning, async dispatch |
 | `consumer` | `MiniKafkaConsumer` — pull-based poll, seek, offset commit/replay |
 | `storage` | `PersistentPartition`, `LogSegment`, `RecordSerializer` — NIO disk persistence |
-| `offset` | `OffsetManager` — per-consumer-group committed offset tracking |
+| `offset` | `OffsetManager`, `PersistentOffsetManager` — durable atomic consumer group offset tracking |
 | `group` | `ConsumerGroupCoordinator`, `RoundRobinAssignor` — dynamic partition rebalancing |
 | `metrics` | `BrokerMetrics` — atomic counters, P99 latency histogram, consumer lag |
 | `network` | `BrokerServer`, `BrokerClient` — binary-framed TCP protocol layer |
@@ -62,7 +62,7 @@ Built to demonstrate deep mastery of **concurrent systems programming**, **NIO s
 - [x] **Producer SDK** — deterministic key-affinity hashing (`(key.hashCode() & 0x7fffffff) % partitions`) and round-robin fallback
 - [x] **Async produce** — virtual-thread dispatch (`Thread.ofVirtual().start(...)`) for concurrent publishing
 - [x] **Consumer SDK** — pull-based `poll(Duration)`, configurable `EARLIEST`/`LATEST` auto-offset-reset, `seek(offset)`
-- [x] **Offset management** — per-consumer-group committed offset tracking; replay from any historical offset
+- [x] **Persistent offset management** — per-consumer-group atomic offset commits (`tmp` + `fsync` + `ATOMIC_MOVE`); automatic recovery on restart & replay from any historical offset
 - [x] **Persistent storage** — `FileChannel` NIO append-only binary log with CRC32 integrity verification
 - [x] **Log segmentation** — rolling log segments with sparse offset indexes; size-based and time-based retention cleanup
 - [x] **Crash recovery** — log replay on broker restart; at-least-once delivery semantics
@@ -79,7 +79,7 @@ Built to demonstrate deep mastery of **concurrent systems programming**, **NIO s
 **Prerequisites:** Java 21+, Maven 3.9+
 
 ```bash
-# Clone and run all 107 tests
+# Clone and run all 116 tests
 git clone https://github.com/chirag-xo/MiniKafka.git
 cd MiniKafka
 mvn test
@@ -87,7 +87,7 @@ mvn test
 
 Expected output:
 ```
-Tests run: 107, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 116, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
@@ -123,9 +123,6 @@ Produce(Disk)| 50,000     | 256 B    | 4        | 137 s        | 365 msg/s      
 
 *Note: Disk Produce runs with strict `FileChannel.force(false)` synchronous fsync per batch to guarantee zero data loss under crash.*
 
-java -cp target/minikafka-0.1.0-SNAPSHOT.jar com.minikafka.benchmark.BenchmarkRunner
-```
-
 ---
 
 ## In-JVM Usage Example
@@ -154,16 +151,20 @@ Broker persistent = new MiniKafkaBroker(Path.of("/var/data/minikafka"));
 
 ## Storage Engine
 
-Each partition maps to a folder with rolling log segments:
+Each partition maps to a folder with rolling log segments, and committed consumer group offsets are persisted atomically under `offsets/`:
 
 ```
 data/
-└── orders/
-    └── partition-0/
-        ├── 00000000000000000000.log    ← segment 0 (binary records)
-        ├── 00000000000000000000.index  ← sparse offset → byte-position index
-        ├── 00000000000001048576.log    ← segment 1 (rolled at MAX_SEGMENT_BYTES)
-        └── 00000000000001048576.index
+├── orders/
+│   └── partition-0/
+│       ├── 00000000000000000000.log    ← segment 0 (binary records)
+│       ├── 00000000000000000000.index  ← sparse offset → byte-position index
+│       ├── 00000000000001048576.log    ← segment 1 (rolled at MAX_SEGMENT_BYTES)
+│       └── 00000000000001048576.index
+└── offsets/
+    └── billing-service/
+        ├── orders-0.offset             ← atomic temp + fsync + ATOMIC_MOVE
+        └── orders-1.offset
 ```
 
 **Binary record format:**
@@ -249,7 +250,7 @@ src/
 │   ├── producer/       Producer.java, MiniKafkaProducer.java, Partitioner.java
 │   ├── consumer/       Consumer.java, MiniKafkaConsumer.java
 │   ├── storage/        PersistentPartition.java, LogSegment.java, RecordSerializer.java
-│   ├── offset/         OffsetManager.java, InMemoryOffsetManager.java
+│   ├── offset/         OffsetManager.java, InMemoryOffsetManager.java, PersistentOffsetManager.java
 │   ├── group/          ConsumerGroupCoordinator.java, RoundRobinAssignor.java
 │   ├── metrics/        BrokerMetrics.java, MetricsServer.java
 │   ├── network/        BrokerServer.java, BrokerClient.java, RequestType.java

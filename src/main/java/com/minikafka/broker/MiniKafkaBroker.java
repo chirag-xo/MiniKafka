@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MiniKafkaBroker implements Broker {
 
     private final Map<String, Topic> topics = new ConcurrentHashMap<>();
-    private final com.minikafka.offset.OffsetManager offsetManager = new com.minikafka.offset.InMemoryOffsetManager();
+    private final com.minikafka.offset.OffsetManager offsetManager;
     private final com.minikafka.group.ConsumerGroupCoordinator groupCoordinator = new com.minikafka.group.InMemoryConsumerGroupCoordinator(this);
     private final com.minikafka.metrics.BrokerMetrics metrics = new com.minikafka.metrics.BrokerMetrics();
     private final java.nio.file.Path dataDir;
@@ -35,6 +35,9 @@ public class MiniKafkaBroker implements Broker {
 
     public MiniKafkaBroker(java.nio.file.Path dataDir) {
         this.dataDir = dataDir;
+        this.offsetManager = (dataDir != null)
+                ? new com.minikafka.offset.PersistentOffsetManager(dataDir)
+                : new com.minikafka.offset.InMemoryOffsetManager();
         if (dataDir != null && java.nio.file.Files.exists(dataDir)) {
             recoverTopicsFromDisk();
         }
@@ -42,16 +45,18 @@ public class MiniKafkaBroker implements Broker {
 
     private void recoverTopicsFromDisk() {
         try (var stream = java.nio.file.Files.list(dataDir)) {
-            stream.filter(java.nio.file.Files::isDirectory).forEach(topicPath -> {
-                String topicName = topicPath.getFileName().toString();
-                // Count partition directories
-                try (var pStream = java.nio.file.Files.list(topicPath)) {
-                    long pCount = pStream.filter(p -> p.getFileName().toString().startsWith("partition-")).count();
-                    if (pCount > 0) {
-                        topics.put(topicName, new Topic(topicName, (int) pCount, dataDir));
-                    }
-                } catch (java.io.IOException ignored) {}
-            });
+            stream.filter(java.nio.file.Files::isDirectory)
+                    .filter(p -> !p.getFileName().toString().equals("offsets"))
+                    .forEach(topicPath -> {
+                        String topicName = topicPath.getFileName().toString();
+                        // Count partition directories
+                        try (var pStream = java.nio.file.Files.list(topicPath)) {
+                            long pCount = pStream.filter(p -> p.getFileName().toString().startsWith("partition-")).count();
+                            if (pCount > 0) {
+                                topics.put(topicName, new Topic(topicName, (int) pCount, dataDir));
+                            }
+                        } catch (java.io.IOException ignored) {}
+                    });
         } catch (java.io.IOException ignored) {}
     }
 
