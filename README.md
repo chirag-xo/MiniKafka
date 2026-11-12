@@ -1,300 +1,134 @@
-# MiniKafka 🗂️
+# MiniKafka
 
 [![MiniKafka CI](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml/badge.svg)](https://github.com/chirag-xo/MiniKafka/actions/workflows/ci.yml)
 ![Java 21](https://img.shields.io/badge/Java-21-orange?logo=openjdk)
 ![Maven](https://img.shields.io/badge/Build-Maven-C71A36?logo=apachemaven)
 ![Tests](https://img.shields.io/badge/Tests-149%20Passing-brightgreen)
-![Zero Dependencies](https://img.shields.io/badge/Runtime%20Dependencies-Zero-blue)
+![Dependencies](https://img.shields.io/badge/Runtime%20Dependencies-None-blue)
 
-A **Kafka-inspired, append-only event-streaming broker** built from scratch in Java 21 — zero external runtime dependencies.
+A lightweight, Kafka-inspired event streaming broker written from scratch in Java 21 with zero external runtime dependencies.
 
-Built to demonstrate deep mastery of **concurrent systems programming**, **NIO storage engines**, **distributed system primitives**, and **clean OOP architecture** in Java.
+Implements segmented append-only `FileChannel` logs, sparse offset indexing, CRC32 torn-write recovery, atomic consumer group offset persistence, bounded producer backpressure, consumer group rebalancing, and a versioned binary TCP protocol.
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    P["Producer SDK\n(Bounded Queue + Backpressure)"] -->|KeyHash / RoundRobin| B["MiniKafkaBroker"]
+    TCP["BrokerClient (TCP v1)"] -->|Virtual-Thread Socket| S["BrokerServer (:9092)"]
+    S --> B
+    B --> T["Topic / Partitions\n(ReentrantReadWriteLock)"]
+    T -->|FileChannel NIO| D["Segmented Log\n(.log + .index)"]
+    B --> O["PersistentOffsetManager\n(Atomic Temp + fsync + Move)"]
+    B --> G["ConsumerGroupCoordinator\n(RoundRobinAssignor)"]
+    C["Consumer SDK\n(poll / seek / commitSync)"] -->|pull| B
+    B --> M["BrokerMetrics\n(/metrics HTTP :9090)"]
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│                         MiniKafka Broker                              │
-│                                                                       │
-│  ┌──────────┐   ┌──────────┐   ┌──────────────────────────────────┐  │
-│  │ Producer │   │ Consumer │   │       ConsumerGroupCoordinator   │  │
-│  │   SDK    │   │   SDK    │   │  (RoundRobin partition assignor) │  │
-│  └────┬─────┘   └────▲─────┘   └──────────────────────────────────┘  │
-│       │   route      │  poll                                          │
-│       ▼              │                                                │
-│  ┌────────────────────────────────────────────────────────────────┐   │
-│  │                         Topic                                  │   │
-│  │   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐  │   │
-│  │   │Partition │   │Partition │   │Partition │   │Partition │  │   │
-│  │   │    0     │   │    1     │   │    2     │   │    3     │  │   │
-│  │   │ (RWLock) │   │ (RWLock) │   │ (RWLock) │   │ (RWLock) │  │   │
-│  │   └─────┬────┘   └─────┬────┘   └─────┬────┘   └─────┬────┘  │   │
-│  └─────────┼──────────────┼──────────────┼──────────────┼────────┘   │
-│            │              │              │              │             │
-│            ▼ FileChannel NIO (append-only binary log)                 │
-│   data/topic/partition-N/{baseOffset}.log + {baseOffset}.index        │
-└───────────────────────────────────────────────────────────────────────┘
-```
-
-**Component breakdown:**
-
-| Package | Responsibility |
-|---------|---------------|
-| `model` | Immutable `Message` record — UUID, key, value, timestamp, topic, partition, offset |
-| `partition` | `Partition` interface — append-only ordered log abstraction |
-| `topic` | `Topic` — logical namespace coordinating N partitions |
-| `broker` | `MiniKafkaBroker` — topic registry, routing, crash recovery |
-| `producer` | `MiniKafkaProducer`, `ProducerConfig`, `BackpressurePolicy` — bounded queue backpressure, partitioning, async workers |
-| `consumer` | `MiniKafkaConsumer` — pull-based poll, seek, offset commit/replay |
-| `storage` | `PersistentPartition`, `LogSegment`, `RecordSerializer` — NIO disk persistence |
-| `offset` | `OffsetManager`, `PersistentOffsetManager` — durable atomic consumer group offset tracking |
-| `group` | `ConsumerGroupCoordinator`, `RoundRobinAssignor` — dynamic partition rebalancing |
-| `metrics` | `BrokerMetrics` — atomic counters, P99 latency histogram, consumer lag |
-| `network` | `BrokerServer`, `BrokerClient` — binary-framed TCP protocol layer |
-
----
-
-## Features
-
-- [x] **Append-only partition log** — strict per-partition FIFO ordering, monotonic offsets
-- [x] **Producer SDK** — deterministic key-affinity hashing (`(key.hashCode() & 0x7fffffff) % partitions`) and round-robin fallback
-- [x] **Async produce & backpressure** — bounded producer queue (`ProducerConfig`), virtual-thread workers, configurable timeout & overload policies (`BLOCK_WITH_TIMEOUT`, `REJECT_IMMEDIATELY`, `CALLER_RUNS`), and queue utilization/rejection metrics
-- [x] **Consumer SDK** — pull-based `poll(Duration)`, configurable `EARLIEST`/`LATEST` auto-offset-reset, `seek(offset)`
-- [x] **Persistent offset management** — per-consumer-group atomic offset commits (`tmp` + `fsync` + `ATOMIC_MOVE`); automatic recovery on restart & replay from any historical offset
-- [x] **Persistent storage** — `FileChannel` NIO append-only binary log with CRC32 integrity verification
-- [x] **Log segmentation** — rolling log segments with sparse offset indexes; size-based and time-based retention cleanup
-- [x] **Crash recovery & torn-write repair** — log replay with CRC32 validation, automatic truncation of partial/corrupt trailing records, sparse index rebuild, and interrupted segment rollover cleanup
-- [x] **Consumer groups** — `RoundRobinAssignor` distributes partitions evenly; rebalances on member join/leave
-- [x] **Concurrency** — `ReentrantReadWriteLock` per partition; concurrent producers never corrupt offsets
-- [x] **Metrics & observability** — zero-dependency HTTP `/metrics` endpoint (JDK `HttpServer`), P99 latency histogram, consumer lag per partition
-- [x] **Robust TCP networking** — versioned (`v1`) binary length-prefixed protocol with request IDs, typed `ResponseStatus` codes, bounded max frame size (4 MB default), socket read/write timeouts, malformed-frame protection, and virtual-thread connections
-- [x] **Benchmark harness** — throughput (msg/sec) and P50/P95/P99 latency measurements
 
 ---
 
 ## Quick Start
 
-**Prerequisites:** Java 21+, Maven 3.9+
+Requires **Java 21+** and **Maven 3.9+**.
 
 ```bash
-# Clone and run all 149 tests
 git clone https://github.com/chirag-xo/MiniKafka.git
 cd MiniKafka
+
+# Run all 149 unit, integration, crash-recovery, and overload tests
 mvn test
+
+# Run the interactive end-to-end demo
+./bin/live-demo.sh
+
+# Run throughput & latency benchmarks
+./bin/benchmark.sh
+
+# Start the TCP broker server (port 9092, data dir ./data)
+./bin/minikafka-server.sh 9092 ./data
 ```
 
-Expected output:
+---
+
+## Live Output
+
+### Interactive Demo (`./bin/live-demo.sh`)
+
+```text
+✔ Broker initialized with durable segmented storage at: minikafka-live-demo...
+✔ Observability /metrics HTTP server running at: http://localhost:9090/metrics
+✔ Topic 'order-events' created with 4 partitions.
+
+--- [1] Producing Live Event Stream (Virtual Threads) ---
+  [PRODUCE] Key: customer-1   ➜ Partition: 2 | Offset: 0 | Data: {"orderId": 1, "amount": $19.99, "status": "CREATED"}
+  [PRODUCE] Key: customer-2   ➜ Partition: 3 | Offset: 0 | Data: {"orderId": 2, "amount": $39.98, "status": "CREATED"}
+  ...
+  [PRODUCE] Key: customer-0   ➜ Partition: 1 | Offset: 7 | Data: {"orderId": 20, "amount": $399.80, "status": "CREATED"}
+
+--- [2] Consumer Group Scaling & Disjoint Partition Assignment ---
+  Consumer-A Assigned Partitions: [order-events-0, order-events-2]
+  Consumer-B Assigned Partitions: [order-events-1, order-events-3]
+
+✔ Successfully processed all 20 messages! (Consumer-A: 8, Consumer-B: 12)
+
+--- [4] Live Broker Metrics Snapshot ---
+messages_produced_total 20
+messages_fetched_total 20
+bytes_written_total 1086
+produce_errors_total 0
+produce_latency_avg_us 3411.55
 ```
+
+### Test Suite (`mvn test`)
+
+```text
 Tests run: 149, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
-**Run the TCP Broker Server & Benchmarks:**
-```bash
-# Compile project
-mvn compile
+### Benchmarks (`./bin/benchmark.sh`)
 
-# 1. Run the performance benchmark suite
-java -cp target/classes com.minikafka.benchmark.BenchmarkRunner
-
-# 2. Start the TCP Broker Server (port 9092)
-java -cp target/classes com.minikafka.network.BrokerServer 9092 ./data
-```
+| Workload | Messages | Payload | Threads | Duration | Throughput | P50 | P95 | P99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| In-Memory Produce | 100,000 | 256 B | 8 | 129 ms | **770,444 msg/s** | 2.0 µs | 26.0 µs | 124.0 µs |
+| In-Memory Consume | 100,000 | 128 B | 1 | 20 ms | **4,870,832 msg/s** | — | — | — |
+| Disk Produce (`fsync`) | 50,000 | 256 B | 4 | 137 s | **365 msg/s** | 10.8 ms | 19.0 ms | 24.0 ms |
 
 ---
 
-## Performance Benchmarks
+## Core Design
 
-Measured on Apple Silicon / Java 21 using `BenchmarkRunner`:
+### 1. Segmented Storage & Crash Recovery
+- **Layout:** Each partition writes to rolling `{baseOffset:020d}.log` and sparse `{baseOffset:020d}.index` files (`INDEX_STRIDE = 8`) under `data/{topic}/partition-{id}/`.
+- **Record Format:** `[length: 4B][magic: 1B (0x4B)][crc32: 8B][timestamp: 8B][offset: 8B][id][key][value]`.
+- **Torn-Write Recovery:** On restart, `LogSegment.recover()` scans from byte 0, verifies magic bytes, CRC32 checksums, and monotonic offsets, truncates any incomplete or corrupt trailing bytes, and rebuilds `.index`. `PersistentPartition` cleans up orphaned `.index`/`.tmp` files and stale empty rolled segments.
+- **Retention:** `LogRetentionManager` enforces time-based (`retention.ms`) and size-based (`retention.bytes`) cleanup while always preserving the active segment.
 
-```
-=========================================================================================================
-                                     MiniKafka Performance Benchmarks                                   
-=========================================================================================================
-Workload     | Messages   | Payload  | Threads  | Duration     | Throughput     | P50 Lat    | P95 Lat    | P99 Lat   
--------------+------------+----------+----------+--------------+----------------+------------+------------+-----------
-Produce (Mem)| 100,000    | 256 B    | 8        | 129 ms       | 770,444 msg/s  | 2.0 µs     | 26.0 µs    | 124.0 µs  
-Consume (Mem)| 100,000    | 128 B    | 1        | 20 ms        | 4,870,832 msg/s| 0.0 µs     | 0.0 µs     | 0.0 µs    
-Produce(Disk)| 50,000     | 256 B    | 4        | 137 s        | 365 msg/s      | 10.8 ms    | 19.0 ms    | 24.0 ms   
-=========================================================================================================
-```
+### 2. Atomic Consumer Offsets
+- `PersistentOffsetManager` persists committed cursors under `data/offsets/{groupId}/{topic}-{partition}.offset`.
+- Commits write to `.offset.tmp`, flush via `FileChannel.force(true)`, and swap via `Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)` so restarts never observe half-written offset state.
 
-*Note: Disk Produce runs with strict `FileChannel.force(false)` synchronous fsync per batch to guarantee zero data loss under crash.*
+### 3. Producer Backpressure
+- `MiniKafkaProducer` enforces a bounded queue capacity (`ProducerConfig`) across `send()` and `sendAsync()` drained by virtual-thread workers.
+- Configurable overload policies (`BackpressurePolicy`):
+  - `BLOCK_WITH_TIMEOUT` — blocks caller up to `sendTimeout`, then throws `ProducerBufferFullException`.
+  - `REJECT_IMMEDIATELY` — fails fast when the buffer is full.
+  - `CALLER_RUNS` — throttles callers by running appends on the calling thread.
+- Tracks `producer_queue_size`, `producer_queue_utilization`, `producer_rejected_total`, and `producer_timed_out_total`.
 
----
-
-## In-JVM Usage Example
-
-```java
-// 1. Start broker (in-memory, no persistence)
-Broker broker = new MiniKafkaBroker();
-broker.createTopic("orders", 4);
-
-// 2. Produce messages
-Producer producer = new MiniKafkaProducer(broker);
-producer.send(ProducerRecord.of("orders", "user-42", "order-placed"));
-producer.sendAsync(ProducerRecord.of("orders", "user-99", "order-shipped")); // virtual thread
-
-// 3. Consume messages (consumer group)
-Consumer consumer = new MiniKafkaConsumer(broker, "billing-service");
-consumer.subscribe(List.of("orders"));
-ConsumerRecords records = consumer.poll(Duration.ofMillis(100));
-consumer.commitSync();
-
-// 4. With disk persistence + crash recovery
-Broker persistent = new MiniKafkaBroker(Path.of("/var/data/minikafka"));
-```
+### 4. Versioned TCP Protocol
+- **Wire Frame:** `[frame_length: 4B][protocol_version: 1B (0x01)][request_type: 1B][request_id: 4B][payload]`
+- **Operations:** `PRODUCE (0x01)`, `FETCH (0x02)`, `CREATE_TOPIC (0x03)`, `LIST_TOPICS (0x04)`, `PING (0x05)`, `ERROR (0x7F)`.
+- **Hardening:** Enforces `maxFrameSize` (4 MB default) before buffer allocation, validates bounded internal field lengths, returns typed `ResponseStatus` codes (`BAD_REQUEST`, `UNSUPPORTED_VERSION`, `UNKNOWN_REQUEST_TYPE`, `FRAME_TOO_LARGE`, `TOPIC_NOT_FOUND`, etc.), and configures socket read (`SO_TIMEOUT`) and write-stall watchdog timeouts.
 
 ---
 
-## Storage Engine
+## Documentation & Scope
 
-Each partition maps to a folder with rolling log segments, and committed consumer group offsets are persisted atomically under `offsets/`:
+- [System Architecture](docs/ARCHITECTURE.md)
+- [Architecture Decision Records (ADRs)](docs/DESIGN_DECISIONS.md)
+- [Product Requirements](docs/PRD.md)
 
-```
-data/
-├── orders/
-│   └── partition-0/
-│       ├── 00000000000000000000.log    ← segment 0 (binary records)
-│       ├── 00000000000000000000.index  ← sparse offset → byte-position index
-│       ├── 00000000000001048576.log    ← segment 1 (rolled at MAX_SEGMENT_BYTES)
-│       └── 00000000000001048576.index
-└── offsets/
-    └── billing-service/
-        ├── orders-0.offset             ← atomic temp + fsync + ATOMIC_MOVE
-        └── orders-1.offset
-```
-
-**Binary record format:**
-```
-[record_length: 4B] [magic: 1B = 0x4B] [crc32: 8B] [timestamp: 8B]
-[offset: 8B] [id_length: 4B] [id_bytes] [key_length: 4B] [key_bytes]
-[val_length: 4B] [val_bytes]
-```
-
-**Read path:** Binary search over segment list → seek via sparse index → linear scan within segment chunk.
-
----
-
-## Concurrency Model
-
-```
-Producers (P1 .. Pn)              Consumers (C1 .. Cm)
-       │                                    ▲
-       ▼ writeLock.lock()                   │ readLock.lock()
-  ┌──────────────────────┐                  │
-  │  Tail append         │  ────────────────┘
-  │  offset++ (atomic)   │   Concurrent readers never block
-  │  fileChannel.force() │   Multiple partitions: fully parallel
-  └──────────────────────┘
-  
-Virtual threads handle async produce & TCP connections (Java 21).
-ReentrantReadWriteLock per partition: writers exclusive, readers concurrent.
-```
-
----
-
-## TCP Protocol
-
-Versioned, length-prefixed binary framing over TCP (port 9092 by default, 4 MB max frame limit, configurable read/write timeouts):
-
-```
-[frame_length: 4B] [protocol_version: 1B = 0x01] [request_type: 1B] [request_id: 4B] [payload: variable]
-
-Request types:
-  0x01 PRODUCE      → [topic_len][topic][partition: 4B][key_len][key][val_len][val]
-  0x02 FETCH        → [topic_len][topic][partition: 4B][from_offset: 8B][max: 4B]
-  0x03 CREATE_TOPIC → [topic_len][topic][partition_count: 4B]
-  0x04 LIST_TOPICS  → (empty payload)
-  0x05 PING         → (empty payload)
-  0x7F ERROR        → (server-to-client protocol error frame)
-
-Response statuses:
-  OK, BAD_REQUEST, UNSUPPORTED_VERSION, UNKNOWN_REQUEST_TYPE, TOPIC_NOT_FOUND,
-  TOPIC_ALREADY_EXISTS, PARTITION_NOT_FOUND, OFFSET_OUT_OF_RANGE, FRAME_TOO_LARGE, INTERNAL_ERROR
-```
-
-One virtual thread per accepted connection — scales to thousands of concurrent clients.
-
----
-
-## Design Decisions
-
-Five Architecture Decision Records documenting every trade-off:
-
-| ADR | Decision |
-|-----|---------|
-| [ADR-001](docs/DESIGN_DECISIONS.md) | Java 21 LTS — explicit JVM concurrency primitives over Go/C++ |
-| [ADR-002](docs/DESIGN_DECISIONS.md) | Apache Maven — standard, declarative, interview-universal |
-| [ADR-003](docs/DESIGN_DECISIONS.md) | Single-JVM broker — solid domain logic before distributed complexity |
-| [ADR-004](docs/DESIGN_DECISIONS.md) | Key-affinity hashing — `(key.hashCode() & 0x7fffffff) % N` vs. Murmur2 |
-| [ADR-005](docs/DESIGN_DECISIONS.md) | Virtual threads — cheap concurrent blocking, not reactive non-blocking I/O |
-
----
-
-## Explicit Non-Goals
-
-MiniKafka deliberately excludes:
-- **Multi-broker clustering** — no Raft, no ZooKeeper, no KRaft (single JVM)
-- **Exactly-Once Semantics** — targets rock-solid **At-Least-Once** delivery
-- **External frameworks** — no Spring Boot, no Netty, no message broker libraries
-- **Full cooperative sticky rebalance** — round-robin group assignment only
-
----
-
-## Project Structure
-
-```
-src/
-├── main/java/com/minikafka/
-│   ├── model/          Message.java (Java 21 record)
-│   ├── partition/      Partition.java (interface), InMemoryPartition.java
-│   ├── topic/          Topic.java
-│   ├── broker/         Broker.java (interface), MiniKafkaBroker.java
-│   ├── producer/       Producer.java, MiniKafkaProducer.java, ProducerConfig.java, BackpressurePolicy.java, ...
-│   ├── consumer/       Consumer.java, MiniKafkaConsumer.java
-│   ├── storage/        PersistentPartition.java, LogSegment.java, RecordSerializer.java
-│   ├── offset/         OffsetManager.java, InMemoryOffsetManager.java, PersistentOffsetManager.java
-│   ├── group/          ConsumerGroupCoordinator.java, RoundRobinAssignor.java
-│   ├── metrics/        BrokerMetrics.java, MetricsServer.java
-│   ├── network/        BrokerServer.java, BrokerClient.java, NetworkProtocol.java, ResponseStatus.java, RequestType.java
-│   ├── benchmark/      BenchmarkRunner.java
-│   └── exception/      MiniKafkaException.java (and subtypes)
-└── test/java/com/minikafka/
-    ├── benchmark/      BenchmarkRunnerTest.java
-    ├── broker/         MiniKafkaBrokerTest.java
-    ├── consumer/       MiniKafkaConsumerTest.java, ConsumerGroupIntegrationTest.java, ...
-    ├── group/          ConsumerGroupCoordinatorTest.java, RoundRobinAssignorTest.java
-    ├── metrics/        BrokerMetricsTest.java, MetricsServerTest.java
-    ├── network/        BrokerServerTest.java, NetworkProtocolTest.java
-    ├── offset/         InMemoryOffsetManagerTest.java, PersistentOffsetManagerTest.java
-    ├── partition/      InMemoryPartitionTest.java
-    ├── producer/       MiniKafkaProducerTest.java, PartitionerTest.java, ProducerBackpressureTest.java
-    ├── storage/        PersistentPartitionTest.java, TornWriteAndCrashRecoveryTest.java, ...
-    └── model/          MessageTest.java
-```
-
----
-
-## Skills Demonstrated
-
-| Skill | Implementation |
-|-------|---------------|
-| **Core Java / OOP** | Clean interface hierarchy: `Partition`, `Broker`, `Consumer`, `Producer` |
-| **Java 21 Features** | `record`, virtual threads, `sealed interfaces`, pattern matching |
-| **Concurrency** | `ReentrantReadWriteLock`, `ConcurrentHashMap`, `Semaphore`, `LongAdder`, virtual threads |
-| **Java NIO / I/O** | `FileChannel`, `ByteBuffer`, `force(true)` durability, atomic `ATOMIC_MOVE` writes |
-| **Binary Protocols** | Versioned (`v1`) TCP framing, request IDs, `ResponseStatus` codes, CRC32 record validation |
-| **Overload Management** | Bounded producer queues, `BLOCK_WITH_TIMEOUT`, `REJECT_IMMEDIATELY`, `CALLER_RUNS` |
-| **Data Structures** | Sparse offset index, segment binary search, in-memory index |
-| **System Design** | Producer/consumer pattern, partition parallelism, offset semantics |
-| **Testing** | 149 tests — unit, integration, crash-recovery, concurrency & overload stress (`@Nested`, AssertJ) |
-| **Documentation** | PRD, Architecture doc, 5 ADRs — engineering maturity |
-| **Fault Tolerance** | Torn-write truncation, sparse index rebuild, crash recovery via log replay, at-least-once delivery |
-
----
-
-*Built with Java 21, Apache Maven, JUnit 5, AssertJ — no external runtime dependencies.*
-
+**Explicit Non-Goals:** Multi-broker clustering (Raft/KRaft/ZooKeeper), exactly-once two-phase commits (targets at-least-once delivery), and external frameworks (Spring, Netty).
