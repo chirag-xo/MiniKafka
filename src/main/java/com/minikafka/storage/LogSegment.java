@@ -1,9 +1,12 @@
 package com.minikafka.storage;
 
+import com.minikafka.exception.CorruptRecordException;
+import com.minikafka.exception.InvalidMessageException;
 import com.minikafka.exception.MiniKafkaException;
 import com.minikafka.model.Message;
 
 import java.io.IOException;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -51,6 +54,9 @@ public class LogSegment implements AutoCloseable {
 
     /** Next offset to assign (= baseOffset + recordCount). */
     private long nextOffset;
+
+    /** Number of invalid trailing bytes truncated during recovery (0 if log was clean). */
+    private long truncatedBytesOnRecovery = 0L;
 
     // -------------------------------------------------------------------------
     // Construction
@@ -114,18 +120,19 @@ public class LogSegment implements AutoCloseable {
         int recordSize = buffer.remaining();
 
         try {
-            // Write sparse index entry BEFORE writing the record so the byte position
-            // in the index points to the start of this record.
-            if (recordCount % INDEX_STRIDE == 0) {
-                writeIndexEntry(assignedOffset, sizeBytes);
-            }
+            long recordPosition = sizeBytes;
 
-            // Write the serialized record at the current end of the log file.
-            logChannel.position(sizeBytes);
+            // Write the serialized record at the current end of the log file first (log is source of truth).
+            logChannel.position(recordPosition);
             while (buffer.hasRemaining()) {
                 logChannel.write(buffer);
             }
             logChannel.force(false);
+
+            // Write sparse index entry after the log record is durable.
+            if (recordCount % INDEX_STRIDE == 0) {
+                writeIndexEntry(assignedOffset, recordPosition);
+            }
 
             sizeBytes += recordSize;
             recordCount++;
@@ -218,6 +225,9 @@ public class LogSegment implements AutoCloseable {
                     }
                 }
                 startBytePosition = indexEntries[best] & 0xFFFFFFFFL;
+                if (startBytePosition < 0 || startBytePosition >= sizeBytes) {
+                    startBytePosition = 0L;
+                }
             }
 
             // Linear scan from startBytePosition, skip until fromOffset.
@@ -232,6 +242,10 @@ public class LogSegment implements AutoCloseable {
                 if (read < 4) break;
                 lenBuf.flip();
                 int bodyLen = lenBuf.getInt();
+                if (bodyLen <= 0 || pos + 4L + bodyLen > sizeBytes) {
+                    throw new CorruptRecordException(
+                            "Corrupt record length " + bodyLen + " at position " + pos + " in " + logFile);
+                }
 
                 ByteBuffer fullRecord = ByteBuffer.allocate(4 + bodyLen);
                 fullRecord.putInt(bodyLen);
@@ -290,17 +304,18 @@ public class LogSegment implements AutoCloseable {
 
         try {
             long fileSize = segment.logChannel.size();
-            if (fileSize == 0) {
-                return segment;
-            }
 
-            // Reset to start-of-file and rebuild index from scratch.
+            // Always truncate stale/corrupt index data and rebuild from the verified log.
+            segment.indexChannel.truncate(0);
             segment.sizeBytes = 0L;
             segment.recordCount = 0L;
             segment.nextOffset = baseOffset;
+            segment.truncatedBytesOnRecovery = 0L;
 
-            // Truncate any stale index file.
-            segment.indexChannel.truncate(0);
+            if (fileSize == 0) {
+                segment.indexChannel.force(true);
+                return segment;
+            }
 
             long pos = 0L;
             ByteBuffer lenBuf = ByteBuffer.allocate(4);
@@ -309,12 +324,15 @@ public class LogSegment implements AutoCloseable {
                 segment.logChannel.position(pos);
                 lenBuf.clear();
                 int r = segment.logChannel.read(lenBuf);
-                if (r < 4) break;
+                if (r < 4) {
+                    // Partial length prefix (torn write)
+                    break;
+                }
                 lenBuf.flip();
                 int bodyLen = lenBuf.getInt();
 
-                if (bodyLen <= 0 || pos + 4 + bodyLen > fileSize) {
-                    // Truncate corrupt tail.
+                if (bodyLen <= 0 || pos + 4L + bodyLen > fileSize) {
+                    // Invalid length or partial record body (torn write / truncated file)
                     break;
                 }
 
@@ -326,23 +344,42 @@ public class LogSegment implements AutoCloseable {
                     if (read < 0) break;
                     remaining -= read;
                 }
+                if (remaining > 0) {
+                    break;
+                }
                 fullRecord.flip();
 
-                Message msg = RecordSerializer.deserialize(fullRecord, topic, partitionId);
+                Message msg;
+                try {
+                    msg = RecordSerializer.deserialize(fullRecord, topic, partitionId);
+                } catch (CorruptRecordException | InvalidMessageException | BufferUnderflowException
+                        | NegativeArraySizeException | IllegalArgumentException e) {
+                    // Corrupted trailing record (bad magic, CRC mismatch, or malformed payload) -> truncate here
+                    break;
+                }
 
-                // Write sparse index entry if appropriate.
+                if (msg.offset() != segment.nextOffset) {
+                    // Non-contiguous offset in trailing data -> truncate invalid tail
+                    break;
+                }
+
+                // Write sparse index entry for the verified record.
                 if (segment.recordCount % INDEX_STRIDE == 0) {
                     segment.writeIndexEntry(msg.offset(), pos);
                 }
 
                 segment.recordCount++;
-                segment.sizeBytes = pos + 4 + bodyLen;
+                segment.sizeBytes = pos + 4L + bodyLen;
                 segment.nextOffset = msg.offset() + 1;
                 pos = segment.sizeBytes;
             }
 
-            // Truncate the log file to the last good record boundary.
-            segment.logChannel.truncate(segment.sizeBytes);
+            if (segment.sizeBytes < fileSize) {
+                segment.truncatedBytesOnRecovery = fileSize - segment.sizeBytes;
+                segment.logChannel.truncate(segment.sizeBytes);
+                segment.logChannel.force(true);
+            }
+            segment.indexChannel.force(true);
 
             return segment;
         } catch (IOException e) {
@@ -354,6 +391,11 @@ public class LogSegment implements AutoCloseable {
     // -------------------------------------------------------------------------
     // Getters
     // -------------------------------------------------------------------------
+
+    /** @return number of invalid trailing bytes truncated during recovery (0 if clean). */
+    public long getTruncatedBytesOnRecovery() {
+        return truncatedBytesOnRecovery;
+    }
 
     /** @return the base (first) offset of this segment. */
     public long getBaseOffset() {

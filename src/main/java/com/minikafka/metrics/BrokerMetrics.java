@@ -30,6 +30,13 @@ public class BrokerMetrics {
     private final LongAdder bytesRead = new LongAdder();
     private final LongAdder produceErrors = new LongAdder();
 
+    // --- Producer Queue & Backpressure Metrics ---
+    private final AtomicLong producerQueueSize = new AtomicLong(0);
+    private final AtomicLong producerQueueCapacity = new AtomicLong(0);
+    private final LongAdder producerRejected = new LongAdder();
+    private final LongAdder producerTimedOut = new LongAdder();
+    private final LongAdder producerCallerRuns = new LongAdder();
+
     // --- Latency Histogram (microseconds, lock-free bucket array) ---
     // Buckets: <100µs, <500µs, <1ms, <5ms, <10ms, <50ms, <100ms, >=100ms
     private static final long[] BUCKET_UPPER_BOUNDS_US = {100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, Long.MAX_VALUE};
@@ -85,12 +92,49 @@ public class BrokerMetrics {
         consumerLag.computeIfAbsent(key, k -> new AtomicLong()).set(lag);
     }
 
+    // --- Producer Queue & Backpressure recording ---
+    public void registerProducerCapacity(int capacity) {
+        producerQueueCapacity.addAndGet(capacity);
+    }
+
+    public void unregisterProducerCapacity(int capacity) {
+        producerQueueCapacity.updateAndGet(v -> Math.max(0, v - capacity));
+    }
+
+    public void recordProducerQueueEnqueue() {
+        producerQueueSize.incrementAndGet();
+    }
+
+    public void recordProducerQueueDequeue() {
+        producerQueueSize.updateAndGet(v -> Math.max(0, v - 1));
+    }
+
+    public void recordProducerRejected(boolean timedOut) {
+        producerRejected.increment();
+        if (timedOut) {
+            producerTimedOut.increment();
+        }
+    }
+
+    public void recordProducerCallerRuns() {
+        producerCallerRuns.increment();
+    }
+
     // --- Snapshot / export methods ---
     public long getMessagesProduced() { return messagesProduced.sum(); }
     public long getMessagesFetched() { return messagesFetched.sum(); }
     public long getBytesWritten() { return bytesWritten.sum(); }
     public long getBytesRead() { return bytesRead.sum(); }
     public long getProduceErrors() { return produceErrors.sum(); }
+    public long getProducerQueueSize() { return producerQueueSize.get(); }
+    public long getProducerQueueCapacity() { return producerQueueCapacity.get(); }
+    public double getProducerQueueUtilization() {
+        long cap = producerQueueCapacity.get();
+        return cap <= 0 ? 0.0 : (double) producerQueueSize.get() / cap;
+    }
+    public long getProducerRejectedTotal() { return producerRejected.sum(); }
+    public long getProducerTimedOutTotal() { return producerTimedOut.sum(); }
+    public long getProducerCallerRunsTotal() { return producerCallerRuns.sum(); }
 
     /**
      * Returns the per-bucket histogram as an array parallel to BUCKET_UPPER_BOUNDS_US.
@@ -133,6 +177,12 @@ public class BrokerMetrics {
         sb.append("bytes_written_total ").append(getBytesWritten()).append("\n");
         sb.append("bytes_read_total ").append(getBytesRead()).append("\n");
         sb.append("produce_errors_total ").append(getProduceErrors()).append("\n");
+        sb.append("producer_queue_size ").append(getProducerQueueSize()).append("\n");
+        sb.append("producer_queue_capacity ").append(getProducerQueueCapacity()).append("\n");
+        sb.append("producer_queue_utilization ").append(String.format("%.4f", getProducerQueueUtilization())).append("\n");
+        sb.append("producer_rejected_total ").append(getProducerRejectedTotal()).append("\n");
+        sb.append("producer_timed_out_total ").append(getProducerTimedOutTotal()).append("\n");
+        sb.append("producer_caller_runs_total ").append(getProducerCallerRunsTotal()).append("\n");
         sb.append("produce_latency_samples ").append(getLatencySamples()).append("\n");
         sb.append("produce_latency_avg_us ").append(String.format("%.2f", getAvgLatencyUs())).append("\n");
 

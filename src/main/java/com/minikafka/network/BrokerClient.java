@@ -1,6 +1,11 @@
 package com.minikafka.network;
 
 import com.minikafka.exception.MiniKafkaException;
+import com.minikafka.exception.OffsetOutOfRangeException;
+import com.minikafka.exception.PartitionNotFoundException;
+import com.minikafka.exception.ProtocolException;
+import com.minikafka.exception.TopicAlreadyExistsException;
+import com.minikafka.exception.TopicNotFoundException;
 import com.minikafka.model.Message;
 
 import java.io.BufferedInputStream;
@@ -8,6 +13,8 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -18,44 +25,62 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Thread-safe client communicating with a remote {@link BrokerServer} over TCP
- * using MiniKafka's binary framed protocol.
+ * using MiniKafka's versioned, bounded binary framed protocol.
  */
 public class BrokerClient implements AutoCloseable {
 
-    private final String host;
-    private final int port;
+    public static final int DEFAULT_CONNECT_TIMEOUT_MS = 5_000;
+    public static final int DEFAULT_READ_TIMEOUT_MS = 10_000;
+
     private final Socket socket;
     private final DataInputStream in;
     private final DataOutputStream out;
-    private final AtomicInteger correlationSeq = new AtomicInteger(1);
+    private final int maxFrameSize;
+    private final AtomicInteger requestIdSeq = new AtomicInteger(1);
     private final Object ioLock = new Object();
     private volatile boolean closed = false;
 
     public BrokerClient(String host, int port) throws IOException {
-        this.host = Objects.requireNonNull(host, "Host cannot be null");
-        this.port = port;
+        this(host, port, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS, NetworkProtocol.DEFAULT_MAX_FRAME_SIZE);
+    }
+
+    public BrokerClient(String host, int port, int connectTimeoutMs, int readTimeoutMs, int maxFrameSize)
+            throws IOException {
+        Objects.requireNonNull(host, "Host cannot be null");
+        if (maxFrameSize < NetworkProtocol.HEADER_SIZE) {
+            throw new IllegalArgumentException("maxFrameSize must be >= " + NetworkProtocol.HEADER_SIZE);
+        }
+        this.maxFrameSize = maxFrameSize;
         this.socket = new Socket();
         this.socket.setTcpNoDelay(true);
-        this.socket.connect(new InetSocketAddress(host, port), 5000);
+        if (readTimeoutMs > 0) {
+            this.socket.setSoTimeout(readTimeoutMs);
+        }
+        this.socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
         this.in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
         this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
     }
 
+    /**
+     * Stream-based constructor for deterministic in-process protocol testing.
+     */
+    BrokerClient(InputStream rawIn, OutputStream rawOut, int maxFrameSize) {
+        this.socket = null;
+        this.maxFrameSize = maxFrameSize;
+        this.in = new DataInputStream(new BufferedInputStream(rawIn));
+        this.out = new DataOutputStream(new BufferedOutputStream(rawOut));
+    }
+
     public long produce(String topic, int partition, String key, byte[] value) {
         ensureOpen();
-        int corrId = correlationSeq.incrementAndGet();
+        int reqId = requestIdSeq.incrementAndGet();
         synchronized (ioLock) {
             try {
-                NetworkProtocol.writeProduceRequest(out, corrId, topic, partition, key, value);
-                int frameLen = in.readInt();
-                byte respType = in.readByte();
-                int respCorrId = in.readInt();
-                if (respCorrId != corrId) {
-                    throw new MiniKafkaException("Correlation ID mismatch: expected " + corrId + ", got " + respCorrId);
-                }
-                NetworkProtocol.ProduceResponse resp = NetworkProtocol.readProduceResponse(in, respCorrId);
-                if (resp.status() != NetworkProtocol.STATUS_OK) {
-                    throw new MiniKafkaException("Produce failed on server: " + resp.error());
+                NetworkProtocol.writeProduceRequest(out, reqId, topic, partition, key, value, maxFrameSize);
+                NetworkProtocol.Frame frame = readAndCheckResponseFrame(reqId, RequestType.PRODUCE);
+                NetworkProtocol.ProduceResponse resp = NetworkProtocol.decodeProduceResponse(frame);
+                if (resp.status() != ResponseStatus.OK) {
+                    throw mapStatusToException(resp.status(), resp.error(), topic, partition);
                 }
                 return resp.offset();
             } catch (IOException e) {
@@ -71,19 +96,14 @@ public class BrokerClient implements AutoCloseable {
 
     public List<Message> fetch(String topic, int partition, long fromOffset, int maxMessages) {
         ensureOpen();
-        int corrId = correlationSeq.incrementAndGet();
+        int reqId = requestIdSeq.incrementAndGet();
         synchronized (ioLock) {
             try {
-                NetworkProtocol.writeFetchRequest(out, corrId, topic, partition, fromOffset, maxMessages);
-                int frameLen = in.readInt();
-                byte respType = in.readByte();
-                int respCorrId = in.readInt();
-                if (respCorrId != corrId) {
-                    throw new MiniKafkaException("Correlation ID mismatch: expected " + corrId + ", got " + respCorrId);
-                }
-                NetworkProtocol.FetchResponse resp = NetworkProtocol.readFetchResponse(in, respCorrId, topic, partition);
-                if (resp.status() != NetworkProtocol.STATUS_OK) {
-                    throw new MiniKafkaException("Fetch failed on server: " + resp.error());
+                NetworkProtocol.writeFetchRequest(out, reqId, topic, partition, fromOffset, maxMessages);
+                NetworkProtocol.Frame frame = readAndCheckResponseFrame(reqId, RequestType.FETCH);
+                NetworkProtocol.FetchResponse resp = NetworkProtocol.decodeFetchResponse(frame, topic, partition);
+                if (resp.status() != ResponseStatus.OK) {
+                    throw mapStatusToException(resp.status(), resp.error(), topic, partition);
                 }
                 return resp.messages();
             } catch (IOException e) {
@@ -94,19 +114,14 @@ public class BrokerClient implements AutoCloseable {
 
     public void createTopic(String topic, int partitionCount) {
         ensureOpen();
-        int corrId = correlationSeq.incrementAndGet();
+        int reqId = requestIdSeq.incrementAndGet();
         synchronized (ioLock) {
             try {
-                NetworkProtocol.writeCreateTopicRequest(out, corrId, topic, partitionCount);
-                int frameLen = in.readInt();
-                byte respType = in.readByte();
-                int respCorrId = in.readInt();
-                if (respCorrId != corrId) {
-                    throw new MiniKafkaException("Correlation ID mismatch: expected " + corrId + ", got " + respCorrId);
-                }
-                NetworkProtocol.CreateTopicResponse resp = NetworkProtocol.readCreateTopicResponse(in, respCorrId);
-                if (resp.status() != NetworkProtocol.STATUS_OK) {
-                    throw new MiniKafkaException("Create topic failed: " + resp.error());
+                NetworkProtocol.writeCreateTopicRequest(out, reqId, topic, partitionCount);
+                NetworkProtocol.Frame frame = readAndCheckResponseFrame(reqId, RequestType.CREATE_TOPIC);
+                NetworkProtocol.CreateTopicResponse resp = NetworkProtocol.decodeCreateTopicResponse(frame);
+                if (resp.status() != ResponseStatus.OK) {
+                    throw mapStatusToException(resp.status(), resp.error(), topic, -1);
                 }
             } catch (IOException e) {
                 throw new MiniKafkaException("CreateTopic network error: " + e.getMessage(), e);
@@ -116,19 +131,14 @@ public class BrokerClient implements AutoCloseable {
 
     public Set<String> listTopics() {
         ensureOpen();
-        int corrId = correlationSeq.incrementAndGet();
+        int reqId = requestIdSeq.incrementAndGet();
         synchronized (ioLock) {
             try {
-                NetworkProtocol.writeListTopicsRequest(out, corrId);
-                int frameLen = in.readInt();
-                byte respType = in.readByte();
-                int respCorrId = in.readInt();
-                if (respCorrId != corrId) {
-                    throw new MiniKafkaException("Correlation ID mismatch: expected " + corrId + ", got " + respCorrId);
-                }
-                NetworkProtocol.ListTopicsResponse resp = NetworkProtocol.readListTopicsResponse(in, respCorrId);
-                if (resp.status() != NetworkProtocol.STATUS_OK) {
-                    throw new MiniKafkaException("List topics failed: " + resp.error());
+                NetworkProtocol.writeListTopicsRequest(out, reqId);
+                NetworkProtocol.Frame frame = readAndCheckResponseFrame(reqId, RequestType.LIST_TOPICS);
+                NetworkProtocol.ListTopicsResponse resp = NetworkProtocol.decodeListTopicsResponse(frame);
+                if (resp.status() != ResponseStatus.OK) {
+                    throw mapStatusToException(resp.status(), resp.error(), null, -1);
                 }
                 return resp.topics();
             } catch (IOException e) {
@@ -139,26 +149,53 @@ public class BrokerClient implements AutoCloseable {
 
     public boolean ping() {
         ensureOpen();
-        int corrId = correlationSeq.incrementAndGet();
+        int reqId = requestIdSeq.incrementAndGet();
         synchronized (ioLock) {
             try {
-                out.writeInt(5);
-                out.writeByte(RequestType.PING.getCode());
-                out.writeInt(corrId);
-                out.flush();
-
-                int frameLen = in.readInt();
-                byte respType = in.readByte();
-                int respCorrId = in.readInt();
-                return respType == RequestType.PING.getCode() && respCorrId == corrId;
+                NetworkProtocol.writePingRequest(out, reqId);
+                NetworkProtocol.Frame frame = readAndCheckResponseFrame(reqId, RequestType.PING);
+                return frame.requestTypeCode() == RequestType.PING.getCode() && frame.requestId() == reqId;
             } catch (IOException e) {
                 return false;
             }
         }
     }
 
+    private NetworkProtocol.Frame readAndCheckResponseFrame(int expectedRequestId, RequestType expectedType)
+            throws IOException {
+        NetworkProtocol.Frame frame = NetworkProtocol.readValidatedFrame(in, maxFrameSize);
+        if (frame.requestId() != expectedRequestId) {
+            throw new ProtocolException(ResponseStatus.BAD_REQUEST,
+                    "Request ID mismatch: expected " + expectedRequestId + ", got " + frame.requestId());
+        }
+        if (frame.requestTypeCode() == RequestType.ERROR.getCode()) {
+            NetworkProtocol.ErrorResponse err = NetworkProtocol.decodeErrorResponse(frame);
+            throw new ProtocolException(err.status(),
+                    "Server protocol error [" + err.status() + "]: " + err.error());
+        }
+        if (frame.requestTypeCode() != expectedType.getCode()) {
+            throw new ProtocolException(ResponseStatus.BAD_REQUEST,
+                    "Unexpected response opcode: expected " + expectedType + ", got " + frame.requestTypeCode());
+        }
+        return frame;
+    }
+
+    private static RuntimeException mapStatusToException(ResponseStatus status, String error,
+                                                         String topic, int partition) {
+        return switch (status) {
+            case TOPIC_NOT_FOUND -> new TopicNotFoundException(topic != null ? topic : error);
+            case TOPIC_ALREADY_EXISTS -> new TopicAlreadyExistsException(topic != null ? topic : error);
+            case PARTITION_NOT_FOUND -> new PartitionNotFoundException(
+                    topic != null ? topic : "unknown", partition, -1);
+            case OFFSET_OUT_OF_RANGE -> new OffsetOutOfRangeException(error, -1, 0, -1);
+            case BAD_REQUEST, UNSUPPORTED_VERSION, UNKNOWN_REQUEST_TYPE, FRAME_TOO_LARGE ->
+                    new ProtocolException(status, error);
+            default -> new MiniKafkaException("Server error [" + status + "]: " + error);
+        };
+    }
+
     private void ensureOpen() {
-        if (closed || socket.isClosed()) {
+        if (closed || (socket != null && socket.isClosed())) {
             throw new IllegalStateException("BrokerClient is closed");
         }
     }
@@ -168,8 +205,15 @@ public class BrokerClient implements AutoCloseable {
         if (closed) return;
         closed = true;
         try {
-            socket.close();
+            if (socket != null) {
+                socket.close();
+            }
+        } catch (IOException ignored) {}
+        try {
+            in.close();
+        } catch (IOException ignored) {}
+        try {
+            out.close();
         } catch (IOException ignored) {}
     }
 }
-

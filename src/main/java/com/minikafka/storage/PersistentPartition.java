@@ -40,6 +40,7 @@ public class PersistentPartition implements Partition, AutoCloseable {
     private final String topic;
     private final int id;
     private final Path partitionDir;
+    private final long maxSegmentBytes;
 
     /** Ordered list of segments by ascending baseOffset. */
     private final List<LogSegment> segments = new ArrayList<>();
@@ -66,17 +67,33 @@ public class PersistentPartition implements Partition, AutoCloseable {
      * @throws MiniKafkaException if the directory cannot be created or recovery fails.
      */
     public PersistentPartition(String topic, int id, Path baseDir) {
+        this(topic, id, baseDir, MAX_SEGMENT_BYTES);
+    }
+
+    /**
+     * Creates or recovers a partition with a configurable segment rollover threshold.
+     *
+     * @param topic           topic name; must not be null or blank.
+     * @param id              zero-based partition identifier; must be non-negative.
+     * @param baseDir         root storage directory; must not be null.
+     * @param maxSegmentBytes maximum size in bytes before rolling to a new segment.
+     */
+    public PersistentPartition(String topic, int id, Path baseDir, long maxSegmentBytes) {
         if (topic == null || topic.isBlank()) {
             throw new IllegalArgumentException("Topic name cannot be null or blank");
         }
         if (id < 0) {
             throw new IllegalArgumentException("Partition ID must be non-negative: " + id);
         }
+        if (maxSegmentBytes <= 0) {
+            throw new IllegalArgumentException("maxSegmentBytes must be positive: " + maxSegmentBytes);
+        }
         Objects.requireNonNull(baseDir, "Base storage directory cannot be null");
 
         this.topic = topic;
         this.id = id;
         this.partitionDir = baseDir.resolve(topic).resolve("partition-" + id);
+        this.maxSegmentBytes = maxSegmentBytes;
 
         try {
             Files.createDirectories(partitionDir);
@@ -88,16 +105,32 @@ public class PersistentPartition implements Partition, AutoCloseable {
     }
 
     /**
-     * Scans the partition directory for {@code *.log} files, sorts them by their
-     * base-offset filename prefix, and recovers each {@link LogSegment} from disk.
-     * If no segments exist yet, creates the first empty segment at offset 0.
+     * Scans the partition directory for {@code *.log} files, cleans up any orphaned
+     * {@code *.index} or temporary files left by interrupted rollovers, sorts segments
+     * by base-offset, and recovers each {@link LogSegment} from disk.
      */
     private void recoverOrInit() {
-        try (Stream<Path> paths = Files.list(partitionDir)) {
-            List<Path> logFiles = paths
-                    .filter(p -> p.getFileName().toString().endsWith(".log"))
-                    .sorted()
-                    .toList();
+        try {
+            List<Path> allFiles;
+            try (Stream<Path> paths = Files.list(partitionDir)) {
+                allFiles = paths.filter(Files::isRegularFile).sorted().toList();
+            }
+
+            List<Path> logFiles = new ArrayList<>();
+            for (Path file : allFiles) {
+                String name = file.getFileName().toString();
+                if (name.endsWith(".tmp")) {
+                    Files.deleteIfExists(file);
+                } else if (name.endsWith(".log")) {
+                    logFiles.add(file);
+                } else if (name.endsWith(".index")) {
+                    String logSiblingName = name.replace(".index", ".log");
+                    if (!Files.exists(partitionDir.resolve(logSiblingName))) {
+                        // Orphaned index file left by interrupted rollover or deletion
+                        Files.deleteIfExists(file);
+                    }
+                }
+            }
 
             if (logFiles.isEmpty()) {
                 // Brand-new partition: create the first segment starting at offset 0.
@@ -108,9 +141,20 @@ public class PersistentPartition implements Partition, AutoCloseable {
 
             for (Path logFile : logFiles) {
                 String name = logFile.getFileName().toString();
-                // Strip ".log" suffix to get the 20-digit base-offset string.
                 long baseOffset = Long.parseLong(name.replace(".log", ""));
                 LogSegment seg = LogSegment.recover(partitionDir, baseOffset, topic, id);
+
+                if (!segments.isEmpty()) {
+                    LogSegment prev = segments.get(segments.size() - 1);
+                    // If previous segment recovered fewer records (e.g., torn tail) and left an
+                    // empty rolled segment with a gap in baseOffset, discard the empty rolled segment.
+                    if (seg.getSizeBytes() == 0 && seg.getBaseOffset() > prev.getNextOffset()) {
+                        seg.close();
+                        silentDelete(seg.getLogFile());
+                        silentDelete(seg.getIndexFile());
+                        continue;
+                    }
+                }
                 segments.add(seg);
             }
 
@@ -134,11 +178,11 @@ public class PersistentPartition implements Partition, AutoCloseable {
     }
 
     /**
-     * If the active segment has reached {@link #MAX_SEGMENT_BYTES}, closes it and creates
+     * If the active segment has reached {@link #maxSegmentBytes}, closes it and creates
      * a new segment whose base offset equals the current {@code nextOffset}.
      */
     private void maybeRollSegment() {
-        if (activeSegment().isFull()) {
+        if (activeSegment().getSizeBytes() >= maxSegmentBytes) {
             activeSegment().close();
             LogSegment newSeg = new LogSegment(partitionDir, nextOffset);
             segments.add(newSeg);

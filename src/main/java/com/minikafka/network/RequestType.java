@@ -1,14 +1,15 @@
 package com.minikafka.network;
 
 /**
- * Protocol operation codes for MiniKafka binary framed network requests.
+ * Protocol operation codes for MiniKafka binary framed network requests and responses.
  */
 public enum RequestType {
     PRODUCE((byte) 1),
     FETCH((byte) 2),
     CREATE_TOPIC((byte) 3),
     LIST_TOPICS((byte) 4),
-    PING((byte) 5);
+    PING((byte) 5),
+    ERROR((byte) 127);
 
     private final byte code;
 
@@ -29,4 +30,3 @@ public enum RequestType {
         throw new IllegalArgumentException("Unknown RequestType code: " + code);
     }
 }
-
