@@ -1,71 +1,54 @@
-# MiniKafka — Product Requirements Document (PRD)
+# MiniKafka — Product Requirements
 
-## 1. Executive Summary & Vision
-**MiniKafka** is a lightweight, Kafka-inspired distributed event-streaming and message broker system built from scratch in Java 21. 
+## 1. Overview
 
-The primary objective is educational rigor and interview defensibility for SDE-1 backend engineering roles: demonstrating mastery of object-oriented design, core Java, concurrent programming, low-level data structures, persistent storage I/O, failure recovery, and architectural trade-offs without hiding behind third-party abstractions.
+I built **MiniKafka** from scratch in Java 21 to understand how an append-only event streaming broker works under the hood—without relying on Spring, Netty, or existing broker libraries.
 
----
-
-## 2. Target Persona & Use Cases
-* **Primary Persona:** Software engineers, hiring managers, and interviewers evaluating backend core competencies (systems programming, concurrency, clean architecture, storage engines).
-* **Primary Use Case:** Producing and consuming structured event streams across topics and partitions with deterministic ordering, durable persistence, consumer offset tracking, and consumer group scaling.
+The goal was to build a single-node broker with real storage, recovery, backpressure, consumer group coordination, and a binary TCP wire protocol, keeping every layer small enough to reason about directly.
 
 ---
 
-## 3. Core Functional Requirements (Phased)
+## 2. Core Requirements
 
-### Phase 1–2: In-Memory Core Domain & Broker
-* Create topics dynamically with a configurable number of partitions ($N \ge 1$).
-* Represent messages with attributes: unique ID, optional string key, payload, timestamp, topic, partition, and sequential offset.
-* Enforce partition-level monotonic sequential ordering: $Offset_{n+1} = Offset_n + 1$.
+```mermaid
+flowchart LR
+    P["Producer"] -->|partitioned append| B["Broker"]
+    B -->|ordered log| S["Disk Segments (.log + .index)"]
+    B -->|atomic commit| O["Offset Store (.offset)"]
+    B -->|rebalance| G["Consumer Group"]
+    C["Consumer"] -->|poll / seek| B
+```
 
-### Phase 3–4: Producer & Consumer SDK
-* **Producer:** Publish records to topics. Compute deterministic partition assignment via key hash (`hash(key) % partitionCount`) or round-robin if no key is provided.
-* **Consumer:** Subscribe to topics and pull/poll messages starting from a specified offset (`EARLIEST`, `LATEST`, or a specific offset number).
+### Topics & Partitions
+- Create and delete topics dynamically with $N \ge 1$ partitions.
+- Store immutable records (`id`, optional `key`, `value`, `timestamp`, `topic`, `partition`, `offset`).
+- Enforce strictly monotonic per-partition offsets ($Offset_{n+1} = Offset_n + 1$).
 
-### Phase 5: Offset Management & Replay
-* Explicit offset tracking per consumer/consumer-group partition.
-* Ability to commit offsets and replay historical messages from arbitrary offsets.
+### Producer & Backpressure
+- Route keyed records deterministically to the same partition; round-robin when key is `null`.
+- Support synchronous `send()` and asynchronous `sendAsync()` execution.
+- Bound producer memory with configurable queue capacity, timeouts, and overload policies (`BLOCK_WITH_TIMEOUT`, `REJECT_IMMEDIATELY`, `CALLER_RUNS`).
 
-### Phase 6: Persistent Append-Only Log
-* Replace purely in-memory partition stores with append-only file persistence.
-* Guarantee that writes are flushed and recover cleanly on broker restarts.
+### Consumer & Offsets
+- Pull-based `poll(Duration)` with configurable `EARLIEST` / `LATEST` reset policies and `seek()`.
+- Persist committed group offsets atomically to disk so consumer restarts resume without re-processing committed batches.
+- Support consumer groups with automatic round-robin partition assignment when members join or leave.
 
-### Phase 7: Consumer Groups & Load Balancing
-* Group multiple consumers under a single `groupId`.
-* Automatically or cooperatively divide partitions among active consumers in the group (e.g. 4 partitions across 2 consumers = 2 partitions each).
+### Segmented Storage & Crash Recovery
+- Store partition logs as rolling `.log` and sparse `.index` segment files via `FileChannel`.
+- Verify record integrity with magic bytes and CRC32 checksums.
+- Recover valid log prefixes on restart by truncating partial/corrupt trailing records, rebuilding sparse indexes, and cleaning up interrupted segment rollovers.
+- Enforce time-based (`retention.ms`) and size-based (`retention.bytes`) segment cleanup while preserving the active segment.
 
-### Phase 8: Concurrency & Thread Safety
-* Multiple producers publishing concurrently without data corruption or duplicate offsets.
-* Non-blocking or lock-minimized reads for consumers while writers append.
-
-### Phase 9: Crash Recovery & Fault Tolerance
-* Recover broker and partition state accurately from the persistent log after simulated crashes/restarts.
-* Verify at-least-once delivery semantics under crash conditions.
-
-### Phase 10: Log Segmentation & Retention
-* Segment partition logs by size threshold (e.g., roll file at $X$ MB).
-* Time-based and size-based log retention cleanup policies.
-
-### Phase 11–13: Networking, Observability & Benchmarks
-* Lightweight TCP / HTTP client-server communication.
-* Core metrics: publish/fetch throughput, P95/P99 latency, consumer lag.
-* Benchmark harness evaluating high throughput under load.
+### Networking & Observability
+- Serve remote clients over a versioned (`v1`), length-prefixed binary TCP protocol with request IDs, typed `ResponseStatus` codes, frame size limits, and socket read/write timeouts.
+- Expose runtime counters, latency histograms, and producer queue utilization over an embedded `/metrics` HTTP endpoint.
 
 ---
 
-## 4. Non-Functional Requirements
-* **Determinism & Correctness:** Strict per-partition ordering ($O(1)$ append, $O(1)$ indexed reads). Zero silent data loss or duplicate offset assignment.
-* **Performance:** Minimal locking on read paths; sequential I/O patterns for storage.
-* **Simplicity & Readability:** Clean Java 21 idioms (records, virtual threads where suitable, typed concurrency primitives).
-* **Interview Defensibility:** Every architectural choice must have an explicitly documented trade-off.
+## 3. Scope Boundaries
 
----
-
-## 5. Explicit Non-Goals (Scope Boundaries)
-To avoid over-engineering and unrealistic scope, MiniKafka deliberately will **NOT** implement:
-* Multi-broker distributed clustering / Raft consensus / ZooKeeper / KRaft metadata quorums (runs as a single node / single JVM broker).
-* Exactly-Once Semantics (EOS) two-phase commits (we target rock-solid **At-Least-Once**).
-* Heavy frameworks (no Spring Boot, no external message broker libraries).
-* Complex distributed transactions or consumer group rebalance protocols (e.g., full EBG / cooperative sticky rebalance protocols).
+To keep the project focused on core broker internals rather than cluster consensus, MiniKafka intentionally excludes:
+- Multi-broker clustering, replication, Raft, ZooKeeper, or KRaft.
+- Two-phase commits or Exactly-Once Semantics (targets **At-Least-Once** delivery).
+- External frameworks or third-party networking/serialization libraries.
